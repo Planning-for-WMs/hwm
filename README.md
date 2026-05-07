@@ -31,9 +31,19 @@ This codebase builds on [stable-worldmodel](https://github.com/galilai-group/sta
 
 **Installation:**
 ```bash
+# system deps for box2d-py
+sudo apt-get install -y swig
+
 uv venv --python=3.10
 source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
+
+# gym 0.21 / 0.17 need legacy setuptools to build
+printf "setuptools<66\nwheel<0.40\n" > /tmp/build-constraints.txt
+
+uv pip install --build-constraints /tmp/build-constraints.txt 'stable-worldmodel[train,env]'
+
+# the resolver may pin datasets to an ancient version; bump it
+uv pip install -U datasets
 ```
 
 ## Data
@@ -44,10 +54,43 @@ Datasets use the HDF5 format for fast loading. Download the data from [HuggingFa
 tar --zstd -xvf archive.tar.zst
 ```
 
-Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-wm/`). You can override this path:
+Place the extracted `.h5` files under `$STABLEWM_HOME` (the `stable-worldmodel` package default is `~/.stable_worldmodel/`; the README originally referenced `~/.stable-wm/`). Override with:
 ```bash
 export STABLEWM_HOME=/path/to/your/storage
 ```
+
+### Heldout collection (optional)
+
+`collect_heldout.py` records a PushT dataset using `swm.envs.pusht.WeakPolicy`
+(noisy random actions clipped near the block) for evaluating against unseen
+init/goal pairs. Output goes to `$STABLEWM_HOME/<name>.h5` in the same schema
+as the expert dataset, so eval can use it directly. `--dist-constraint 5`
+gives action-magnitude / agent-speed medians within 5% of the expert dataset
+(higher values produce a faster-moving agent and shift the eval distribution).
+
+```bash
+export STABLEWM_HOME=/home/.stable-wm
+python collect_heldout.py --episodes 200 --num-envs 16 --dist-constraint 5
+python eval.py --config-name=pusht.yaml policy=pusht/lewm \
+    eval.dataset_name=pusht_weak_heldout
+```
+
+### Pre-encoding pixels (optional)
+
+`preprocess.py` runs the dataset through the LeWM ViT encoder once and stores
+only the CLS embeddings (192-dim, fp32) plus the original metadata
+(`action`, `proprio`, `state`, `episode_idx`, `step_idx`, `ep_len`,
+`ep_offset`). For pusht-expert-train this shrinks 44 GB → ~1.8 GB.
+
+```bash
+export STABLEWM_HOME=/home/.stable-wm   # or wherever the .h5 lives
+python preprocess.py \
+  --input  $STABLEWM_HOME/pusht_expert_train.h5 \
+  --output $STABLEWM_HOME/pusht_expert_train_emb.h5 \
+  --weights $STABLEWM_HOME/hf_pusht/weights.pt
+```
+
+Original `.h5` is left untouched.
 
 Dataset names are specified without the `.h5` extension. For example, `config/train/data/pusht.yaml` references `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
 
@@ -84,6 +127,18 @@ python eval.py --config-name=pusht.yaml policy=pusht/lewm
 python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
 ```
 
+To plan more episodes in parallel, raise `solver.batch_size` (defaults to 1 in `config/eval/solver/cem.yaml`):
+```bash
+python eval.py --config-name=pusht.yaml policy=pusht/lewm solver.batch_size=16
+```
+Note: `JEPA.get_cost` was patched to unsqueeze a sample dim on `goal_emb` so it
+broadcasts against `pred_emb (B, S, T, D)`; without this, eval fails with a
+`expand_as` rank error for any `batch_size`.
+
+`JEPA.predict` is wrapped in `torch.autocast(bfloat16)` (CUDA only) — the
+predictor (a depth-6 transformer) is the planning bottleneck (5 sequential
+forwards × 30 CEM iters per solve). On L4 this gives ~2× planning speedup;
+output is cast back to the input dtype so downstream ops are unchanged.
 ## Pretrained Checkpoints
 
 Pretrained LeWM checkpoints for each environment are mirrored on the Hugging Face
@@ -156,6 +211,8 @@ src = Path(swm.data.utils.get_cache_dir(), "hf_pusht")
 out = Path(swm.data.utils.get_cache_dir(), "pusht", "lewm_object.ckpt")
 
 cfg = json.loads((src / "config.json").read_text())
+kw = lambda k: {kk: vv for kk, vv in cfg[k].items() if not kk.startswith("_")}  # drop hydra _target_/_partial_
+
 encoder = spt.backbone.utils.vit_hf(
     cfg["encoder"]["size"],
     patch_size=cfg["encoder"]["patch_size"],
@@ -166,8 +223,8 @@ mlp = lambda k: MLP(input_dim=cfg[k]["input_dim"], output_dim=cfg[k]["output_dim
                     hidden_dim=cfg[k]["hidden_dim"], norm_fn=torch.nn.BatchNorm1d)
 model = JEPA(
     encoder=encoder,
-    predictor=ARPredictor(**cfg["predictor"]),
-    action_encoder=Embedder(**cfg["action_encoder"]),
+    predictor=ARPredictor(**kw("predictor")),
+    action_encoder=Embedder(**kw("action_encoder")),
     projector=mlp("projector"),
     pred_proj=mlp("pred_proj"),
 )
@@ -179,6 +236,41 @@ PY
 ```
 
 After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
+
+## Hierarchical world model (HL JEPA)
+
+`hjepa.py` adds a hierarchy on top of a frozen LeWM checkpoint:
+
+- `HLEncoder` (MLP): LL CLS emb (192) → HL state (96)
+- `HLPredictor` (MLP): `(s_hl, macro_a)` → next HL state at *K* LL-frames ahead (default `K=5`)
+- `MacroActionEncoder`: 2-layer transformer (4 heads, dim 128) over K LL action tokens; CLS → MLP → macro action (16-d)
+
+Loss: `||HLP(s_hl_t, MAE(a_t..t+K-1)) - HLE(LL_emb_{t+K})||²` + `λ * SIGReg(HL embeddings)`.
+
+**Train:**
+```bash
+export STABLEWM_HOME=/home/.stable-wm
+python train_hl.py                                          # uses config/train/lewm_hl.yaml
+# checkpoint -> $STABLEWM_HOME/hjepa/hjepa_epoch_<N>_object.ckpt
+```
+
+**Eval (two-stage MPC):** Stage 1 — HL CEM over macro-action sequences finds an
+HL subgoal. Stage 2 — existing LL CEM (via `SubgoalLLModel` adapter) plans
+LL actions to reach the subgoal. Cost in Stage 2 is
+`||HLE(LL_predicted_emb) - subgoal||²`.
+
+```bash
+python eval_hl.py policy_ckpt=$STABLEWM_HOME/hjepa/hjepa_epoch_50_object.ckpt \
+                  eval.dataset_name=pusht_weak_heldout
+```
+
+Hyperparameters live in `config/train/lewm_hl.yaml` (HL dims, MAE size, K) and
+`config/eval/pusht_hl.yaml` (HL CEM `T_HL`, `num_samples`, `n_steps`, plus the
+existing LL solver block).
+
+Caveats:
+- LL is fully frozen during HL training (`HierarchicalJEPA` calls `requires_grad_(False)` on the LL JEPA and forces `eval()` even in train mode).
+- HL CEM samples macro actions from a fitted Gaussian; the macro distribution at eval can drift from MAE outputs on real action sequences seen during training. If HL planning underperforms, consider initializing the HL CEM mean/var from MAE statistics on the train set.
 
 ## Contact & Contributions
 Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`

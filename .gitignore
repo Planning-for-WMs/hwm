@@ -1,0 +1,7 @@
+.venv/
+requirements_frozen*
+environment*.json
+__pycache__
+lightning_logs/
+outputs/
+wandb/

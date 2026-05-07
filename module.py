@@ -283,3 +283,63 @@ class ARPredictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+
+class HLEncoder(nn.Module):
+    """LL CLS embedding (ll_dim) -> HL state (hl_dim)."""
+
+    def __init__(self, ll_dim=192, hl_dim=96, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(ll_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hl_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class HLPredictor(nn.Module):
+    """(HL state, macro_action) -> next HL state."""
+
+    def __init__(self, hl_dim=96, macro_action_dim=16, hidden_dim=256, depth=3):
+        super().__init__()
+        layers = [nn.Linear(hl_dim + macro_action_dim, hidden_dim), nn.GELU()]
+        for _ in range(depth - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers += [nn.Linear(hidden_dim, hl_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, s_hl, macro_a):
+        return self.net(torch.cat([s_hl, macro_a], dim=-1))
+
+
+class MacroActionEncoder(nn.Module):
+    """K low-level action tokens -> CLS via transformer -> MLP -> macro_action."""
+
+    def __init__(self, action_dim=2, num_actions=5, dim=128, depth=2, heads=4,
+                 mlp_dim=512, dim_head=32, macro_action_dim=16):
+        super().__init__()
+        self.input_proj = nn.Linear(action_dim, dim)
+        self.cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, num_actions + 1, dim) * 0.02)
+        self.transformer = Transformer(
+            input_dim=dim, hidden_dim=dim, output_dim=dim,
+            depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim,
+            block_class=Block,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(dim, dim), nn.GELU(),
+            nn.Linear(dim, macro_action_dim),
+        )
+
+    def forward(self, actions):
+        """actions: (B, K, A) -> (B, macro_action_dim)."""
+        B = actions.size(0)
+        x = self.input_proj(actions)  # (B, K, dim)
+        cls = self.cls.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embed[:, : x.size(1)]
+        x = self.transformer(x)
+        return self.head(x[:, 0])

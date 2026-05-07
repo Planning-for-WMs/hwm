@@ -49,10 +49,12 @@ class JEPA(nn.Module):
         emb: (B, T, D)
         act_emb: (B, T, A_emb)
         """
-        preds = self.predictor(emb, act_emb)
-        preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
-        preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
-        return preds
+        in_dtype = emb.dtype
+        with torch.autocast(device_type=emb.device.type, dtype=torch.bfloat16, enabled=emb.is_cuda):
+            preds = self.predictor(emb, act_emb)
+            preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
+            preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
+        return preds.to(in_dtype)
 
     ####################
     ## Inference only ##
@@ -145,7 +147,8 @@ class JEPA(nn.Module):
         goal.pop("action")
         goal = self.encode(goal)
 
-        info_dict["goal_emb"] = goal["emb"]
+        # add sample dim so it broadcasts against pred_emb (B, S, T, D)
+        info_dict["goal_emb"] = goal["emb"].unsqueeze(1)
         info_dict = self.rollout(info_dict, action_candidates)
 
         cost = self.criterion(info_dict)

@@ -1,20 +1,20 @@
 defaults:
   - _self_
-  - data: pusht
+  - data: pusht_hl
 
-output_model_name: lewm
-subdir: ${hydra:job.id}
+output_model_name: hjepa
+subdir: hjepa
 
 num_workers: 6
 train_split: 0.9
 seed: 3072
 img_size: 224
-patch_size: 14
-encoder_scale: tiny
-dump_object: True
+
+# pretrained LL checkpoint (object pickle saved by train.py)
+ll_ckpt: ${oc.env:STABLEWM_HOME}/pusht/lewm_object.ckpt
 
 trainer:
-  max_epochs: 100
+  max_epochs: 50
   devices: auto
   accelerator: gpu
   precision: bf16
@@ -29,7 +29,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 5e-5
+  lr: 1e-4
   weight_decay: 1e-3
 
 wandb:
@@ -43,18 +43,26 @@ wandb:
     log_model: False
 
 wm:
-  type: lewm
-  history_size: 3
-  num_preds: 1
-  embed_dim: 192
+  type: hjepa
+  k: 5                # HL stride in sampled frames
+  ll_dim: 192
+  hl_dim: 96
+  macro_action_dim: 16
+  action_dim: 2
 
-predictor:
-  depth: 6
-  heads: 16
-  mlp_dim: 2048
-  dim_head: 64
-  dropout: 0.1
-  emb_dropout: 0.0
+hle:
+  hidden_dim: 256
+
+hlp:
+  hidden_dim: 256
+  depth: 3
+
+mae:
+  dim: 128
+  depth: 2
+  heads: 4
+  mlp_dim: 512
+  dim_head: 32
 
 loss:
   sigreg:
