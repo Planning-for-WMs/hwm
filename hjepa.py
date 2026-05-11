@@ -6,7 +6,6 @@ HL prediction: HLP(s_hl, macro_a) -> next HL state.
 Loss = ||HLP(...) - HLE(LL_emb_at_+K)||^2  +  lambda * SIGReg(HL embeddings).
 """
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
@@ -51,6 +50,33 @@ class HierarchicalJEPA(nn.Module):
             s = self.predict_hl(s, macro_actions[:, t])
             traj.append(s)
         return torch.stack(traj, dim=1)  # (B, T_HL+1, hl_dim)
+
+    def ll_rollout_from_emb(self, init_emb, action_sequence, history_size: int = 3):
+        """LL autoregressive rollout starting from a precomputed LL embedding
+        (no pixel encoding). Mirrors `JEPA.rollout` but skips the encoder.
+        init_emb: (B, T_obs, ll_dim).  action_sequence: (B, S, T, action_dim).
+        Returns (B, S, T_obs + n_steps + 1, ll_dim)."""
+        B, S, T = action_sequence.shape[:3]
+        H = init_emb.size(1)
+        n_steps = T - H
+
+        emb = init_emb.unsqueeze(1).expand(B, S, -1, -1)
+        emb = rearrange(emb, "b s h d -> (b s) h d").clone()
+
+        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        act = rearrange(act_0, "b s t a -> (b s) t a")
+        act_future = rearrange(act_future, "b s t a -> (b s) t a")
+
+        HS = history_size
+        for t in range(n_steps):
+            act_emb = self.ll.action_encoder(act)
+            pred_emb = self.ll.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+            emb = torch.cat([emb, pred_emb], dim=1)
+            act = torch.cat([act, act_future[:, t : t + 1]], dim=1)
+        act_emb = self.ll.action_encoder(act)
+        pred_emb = self.ll.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+        emb = torch.cat([emb, pred_emb], dim=1)
+        return rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
 
 
 class HLPlanModel(nn.Module):

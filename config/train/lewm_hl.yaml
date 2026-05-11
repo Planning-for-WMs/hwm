@@ -21,8 +21,8 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
-  num_workers: ${num_workers}
+  batch_size: 256
+  num_workers: 12
   persistent_workers: True
   prefetch_factor: 3
   pin_memory: True
@@ -35,7 +35,7 @@ optimizer:
 wandb:
   enabled: True
   config:
-    entity: narendraaironi
+    entity: wms_at_iitb
     project: hwm
     name: ${output_model_name}
     id: ${subdir}
@@ -47,8 +47,8 @@ wm:
   k: 5                # HL stride in sampled frames
   ll_dim: 192
   hl_dim: 96
-  macro_action_dim: 16
-  action_dim: 2
+  macro_action_dim: 4
+  action_dim: 10           # 2 * frameskip (LL packs frameskip actions per token)
 
 hle:
   hidden_dim: 256
@@ -58,11 +58,11 @@ hlp:
   depth: 3
 
 mae:
-  dim: 128
+  dim: 64
   depth: 2
   heads: 4
-  mlp_dim: 512
-  dim_head: 32
+  mlp_dim: 128
+  dim_head: 16
 
 loss:
   sigreg:
@@ -70,3 +70,8 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+log:
+  every_n_epochs: 1
+  rankme_queue: 8192
+  pca_queue: 4096

@@ -241,9 +241,15 @@ After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
 
 `hjepa.py` adds a hierarchy on top of a frozen LeWM checkpoint:
 
-- `HLEncoder` (MLP): LL CLS emb (192) → HL state (96)
-- `HLPredictor` (MLP): `(s_hl, macro_a)` → next HL state at *K* LL-frames ahead (default `K=5`)
-- `MacroActionEncoder`: 2-layer transformer (4 heads, dim 128) over K LL action tokens; CLS → MLP → macro action (16-d)
+- `HLEncoder` (MLP): post-projector LL CLS (192) → HL state (96)
+- `HLPredictor` (MLP, depth 3): `(s_hl, macro_a)` → next HL state at *K* LL-frames ahead (default `K=5`)
+- `MacroActionEncoder`: 2-layer transformer (4 heads, dim 64, mlp 128) over K LL action tokens with **CLS appended at the end** under **causal attention**; CLS → MLP → macro action (4-d)
+
+Training reads the pre-encoded `pusht_expert_train_emb.h5` directly (no LL
+encoder forward at train time) and applies the frozen LL projector once to
+obtain post-projector embeddings — the same representation the LL predictor
+operates on. Target is **not** detached (matches LeWM; collapse is prevented
+by SIGReg).
 
 Loss: `||HLP(s_hl_t, MAE(a_t..t+K-1)) - HLE(LL_emb_{t+K})||²` + `λ * SIGReg(HL embeddings)`.
 

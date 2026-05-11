@@ -18,7 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 
-from hjepa import HierarchicalJEPA, SubgoalLLModel
+from hjepa import HierarchicalJEPA
 
 
 def img_transform(cfg):
@@ -40,32 +40,39 @@ def get_dataset(cfg, name):
 
 # ---- Hierarchical policy ----
 class HierarchicalPolicy(swm.policy.BasePolicy):
-    """Two-stage planner. Stage 1: HL CEM over macro actions -> subgoals.
-    Stage 2: existing LL CEM via SubgoalLLModel adapter."""
+    """Truly open-loop hierarchical planner.
 
-    def __init__(self, hjepa: HierarchicalJEPA, ll_solver, plan_cfg, hl_cfg,
+    Per episode:
+      1. Encode initial obs + goal pixels ONCE.
+      2. HL CEM plans T_HL macro actions -> T_HL subgoals (last replaced by HLE(LL_goal)).
+      3. For each subgoal in sequence, run an inline LL CEM that rolls out the
+         LL predictor from a *latent* init (no pixel encoding); cost is at the
+         final predicted LL emb passed through HLE. The optimal mean's predicted
+         final LL emb becomes the latent init for the *next* subgoal's LL CEM.
+      4. Concatenate all planned actions and execute mechanically. Pixels from
+         the env are NEVER read again during the episode.
+    """
+
+    def __init__(self, hjepa: HierarchicalJEPA, ll_cfg, hl_cfg, action_block: int,
                  process=None, transform=None, **kwargs):
         super().__init__(**kwargs)
         self.type = "hierarchical"
         self.h = hjepa
-        self.ll_solver = ll_solver
-        self.cfg = plan_cfg
+        self.ll_cfg = ll_cfg
         self.hl_cfg = hl_cfg
+        self.action_block = action_block
         self.process = process or {}
         self.transform = transform or {}
         self._action_buffer: deque[torch.Tensor] | None = None
 
-    @property
-    def flatten_receding_horizon(self):
-        return self.cfg.receding_horizon * self.cfg.action_block
-
     def set_env(self, env):
         self.env = env
-        n_envs = getattr(env, "num_envs", 1)
-        self.ll_solver.configure(
-            action_space=env.action_space, n_envs=n_envs, config=self.cfg
+        # buffer holds the entire open-loop plan: T_HL * horizon LL actions,
+        # each expanded to action_block env-step actions.
+        plan_len = (
+            int(self.hl_cfg["T_HL"]) * int(self.ll_cfg["horizon"]) * int(self.action_block)
         )
-        self._action_buffer = deque(maxlen=self.flatten_receding_horizon)
+        self._action_buffer = deque(maxlen=plan_len)
 
     @torch.inference_mode()
     def _hl_cem(self, s_hl_curr, s_hl_goal):
@@ -77,6 +84,7 @@ class HierarchicalPolicy(swm.policy.BasePolicy):
         S = self.hl_cfg["num_samples"]
         topk = self.hl_cfg["topk"]
         n_steps = self.hl_cfg["n_steps"]
+        var_ema = float(self.hl_cfg.get("var_ema", 0.9))
         macro_dim = self.h.mae.head[-1].out_features
 
         mean = torch.zeros(B, T_HL, macro_dim, device=device)
@@ -98,10 +106,48 @@ class HierarchicalPolicy(swm.policy.BasePolicy):
                 cands, 1, idx[:, :, None, None].expand(-1, -1, T_HL, macro_dim)
             )
             mean = elites.mean(dim=1)
-            var = elites.var(dim=1).clamp(min=1e-4)
+            var = var * var_ema
 
         traj = self.h.rollout_hl(s_hl_curr, mean)
         return mean, traj
+
+    @torch.inference_mode()
+    def _ll_cem(self, init_ll_emb, subgoal_hl):
+        """Inline open-loop LL CEM. Plans `horizon` LL actions to reach the
+        subgoal *in HL space*, starting from a latent LL embedding (no pixels).
+        Returns (B, horizon, action_dim) optimal actions and (B, ll_dim)
+        predicted final LL emb (rolled out with the optimal mean)."""
+        B = init_ll_emb.size(0)
+        device = init_ll_emb.device
+        S = int(self.ll_cfg["num_samples"])
+        n_steps = int(self.ll_cfg["n_steps"])
+        topk = int(self.ll_cfg["topk"])
+        horizon = int(self.ll_cfg["horizon"])
+        var_scale = float(self.ll_cfg["var_scale"])
+        var_ema = float(self.ll_cfg.get("var_ema", 0.9))
+        action_dim = 2 * self.action_block  # PushT: 2 * action_block
+
+        mean = torch.zeros(B, horizon, action_dim, device=device)
+        var = var_scale * torch.ones(B, horizon, action_dim, device=device)
+        init = init_ll_emb.unsqueeze(1)  # (B, 1, ll_dim) -- 1-frame history
+
+        for _ in range(n_steps):
+            cands = mean.unsqueeze(1) + var.unsqueeze(1).sqrt() * torch.randn(
+                B, S, horizon, action_dim, device=device
+            )
+            traj = self.h.ll_rollout_from_emb(init, cands)               # (B, S, ?, ll_dim)
+            final_ll = traj[..., -1, :]
+            final_hl = self.h.encode_hl(final_ll)
+            cost = ((final_hl - subgoal_hl.unsqueeze(1)) ** 2).sum(dim=-1)
+            _, idx = torch.topk(cost, k=topk, dim=1, largest=False)
+            elites = torch.gather(
+                cands, 1, idx[:, :, None, None].expand(-1, -1, horizon, action_dim)
+            )
+            mean = elites.mean(dim=1)
+            var = var * var_ema
+
+        traj = self.h.ll_rollout_from_emb(init, mean.unsqueeze(1))       # (B, 1, ?, ll_dim)
+        return mean, traj[:, 0, -1, :]
 
     def get_action(self, info_dict, **kwargs):
         assert "pixels" in info_dict and "goal" in info_dict
@@ -113,26 +159,33 @@ class HierarchicalPolicy(swm.policy.BasePolicy):
                 if torch.is_tensor(info_dict[k]):
                     info_dict[k] = info_dict[k].to(device)
 
-            # encode obs + goal (frozen LL)
+            # ----- one-shot encoding (real obs read here is the LAST one) -----
             with torch.inference_mode():
-                ll_curr = self.h.encode_ll(info_dict["pixels"])         # (B, T_obs, ll_dim)
-                ll_goal = self.h.encode_ll(info_dict["goal"])           # (B, T_obs, ll_dim)
-                s_hl_curr = self.h.encode_hl(ll_curr[:, -1])
-                s_hl_goal = self.h.encode_hl(ll_goal[:, -1])
+                ll_curr = self.h.encode_ll(info_dict["pixels"])[:, -1]   # (B, ll_dim)
+                ll_goal = self.h.encode_ll(info_dict["goal"])[:, -1]
+                s_hl_curr = self.h.encode_hl(ll_curr)
+                s_hl_goal = self.h.encode_hl(ll_goal)
 
-            # Stage 1: HL CEM -> subgoal
-            _, hl_traj = self._hl_cem(s_hl_curr, s_hl_goal)
-            subgoal = hl_traj[:, 1]                                      # (B, hl_dim)
+            # ----- Stage 1: HL CEM (once per episode) -----
+            T_HL = int(self.hl_cfg["T_HL"])
+            _, hl_traj = self._hl_cem(s_hl_curr, s_hl_goal)              # (B, T_HL+1, D)
+            sg_list = [hl_traj[:, t] for t in range(1, T_HL + 1)]
+            sg_list[-1] = s_hl_goal                                       # final = real goal
 
-            # Stage 2: LL CEM to reach subgoal
-            ll_info = {k: v for k, v in info_dict.items() if k != "goal"}
-            ll_info["subgoal_hl"] = subgoal
-            outputs = self.ll_solver(ll_info, init_action=None)
-            actions = outputs["actions"]                                 # (B, horizon, A*ab)
-            plan = actions[:, : self.cfg.receding_horizon].reshape(
-                self.env.num_envs, self.flatten_receding_horizon, -1
+            # ----- Stage 2: chained LL CEM in latent space -----
+            current_ll = ll_curr
+            all_actions = []
+            for subgoal in sg_list:
+                actions, current_ll = self._ll_cem(current_ll, subgoal)
+                all_actions.append(actions)
+            full_plan = torch.cat(all_actions, dim=1)                    # (B, T_HL*H, A_dim)
+
+            plan = full_plan.reshape(
+                self.env.num_envs,
+                T_HL * int(self.ll_cfg["horizon"]) * self.action_block,
+                -1,
             )
-            self._action_buffer.extend(plan.transpose(0, 1))
+            self._action_buffer.extend(plan.transpose(0, 1).cpu())
 
         action = self._action_buffer.popleft().reshape(*self.env.action_space.shape).numpy()
         if "action" in self.process:
@@ -168,14 +221,12 @@ def run(cfg: DictConfig):
     hjepa = hjepa.to("cuda").eval()
     hjepa.requires_grad_(False)
 
-    # ---- LL solver with subgoal cost ----
-    ll_model = SubgoalLLModel(hjepa).to("cuda").eval()
-    plan_cfg = swm.PlanConfig(**cfg.plan_config)
-    ll_solver = hydra.utils.instantiate(cfg.ll_solver, model=ll_model)
-
     policy = HierarchicalPolicy(
-        hjepa=hjepa, ll_solver=ll_solver, plan_cfg=plan_cfg,
-        hl_cfg=OmegaConf.to_container(cfg.hl_cem), process=process, transform=transform,
+        hjepa=hjepa,
+        ll_cfg=OmegaConf.to_container(cfg.ll_cem),
+        hl_cfg=OmegaConf.to_container(cfg.hl_cem),
+        action_block=int(cfg.action_block),
+        process=process, transform=transform,
     )
 
     # ---- episode/start sampling (mirrors eval.py) ----

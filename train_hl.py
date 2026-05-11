@@ -14,34 +14,39 @@ from omegaconf import OmegaConf, open_dict
 
 from hjepa import HierarchicalJEPA
 from module import HLEncoder, HLPredictor, MacroActionEncoder, SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from utils import get_column_normalizer, ModelObjectCallBack, IntervalRankMe, PCALatentViz
 
 
 def hjepa_forward(self, batch, stage, cfg):
-    """HL prediction loss + SIGReg on HL embeddings.  LL is frozen."""
+    """HL prediction loss + SIGReg on HL embeddings.  LL is frozen.
+
+    Reads the pre-encoded LL CLS from `batch['emb']` (pre-projector) and
+    applies the frozen LL projector once to obtain post-projector embeddings,
+    matching the representation the LL predictor was trained on.
+    """
     K = cfg.wm.k
     lambd = cfg.loss.sigreg.weight
 
-    pixels = batch["pixels"]                # (B, K+1, C, H, W)
-    actions = batch["action"][:, :K]        # (B, K, A)
-    actions = torch.nan_to_num(actions, 0.0)
+    pre_emb = batch["emb"]                            # (B, K+1, ll_dim) pre-projector
+    actions = torch.nan_to_num(batch["action"][:, :K], 0.0)  # (B, K, A)
 
-    ll_emb = self.model.encode_ll(pixels)            # (B, K+1, ll_dim) (no grad)
-    B, T = ll_emb.shape[:2]
-    hl_states = self.model.encode_hl(
-        rearrange(ll_emb, "b t d -> (b t) d")
-    ).view(B, T, -1)                                  # (B, K+1, hl_dim)
+    B, T = pre_emb.shape[:2]
+    flat = rearrange(pre_emb, "b t d -> (b t) d")
+    with torch.no_grad():
+        post_emb = self.model.ll.projector(flat)      # frozen LL projector
+    hl_states = self.model.encode_hl(post_emb).view(B, T, -1)  # (B, K+1, hl_dim)
 
     macro = self.model.encode_macro(actions)          # (B, macro_a_dim)
     s_pred = self.model.predict_hl(hl_states[:, 0], macro)
-    s_target = hl_states[:, -1].detach()             # stop-grad target
+    s_target = hl_states[:, -1]                       # match LeWM (no stop-grad)
 
     pred_loss = (s_pred - s_target).pow(2).mean()
     sig_loss = self.sigreg(hl_states.transpose(0, 1))
     loss = pred_loss + lambd * sig_loss
 
     out = {"emb": hl_states, "pred_loss": pred_loss,
-           "sigreg_loss": sig_loss, "loss": loss}
+           "sigreg_loss": sig_loss, "loss": loss,
+           "hl_emb": hl_states.reshape(-1, hl_states.shape[-1]).detach()}  # for queue/RankMe/PCA
     self.log_dict({f"{stage}/{k}": v.detach() for k, v in out.items() if "loss" in k},
                   on_step=True, sync_dist=True)
     return out
@@ -51,13 +56,13 @@ def hjepa_forward(self, batch, stage, cfg):
 def run(cfg):
     # ------------ data ------------
     dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
+    transforms = []  # no pixel preprocessor: we read pre-encoded `emb` directly
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
-            if col.startswith("pixels"):
+            if col.startswith("pixels") or col == "emb":
                 continue
             transforms.append(get_column_normalizer(dataset, col, col))
-    dataset.transform = spt.data.transforms.Compose(*transforms)
+    dataset.transform = spt.data.transforms.Compose(*transforms) if transforms else None
 
     rnd = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -81,7 +86,7 @@ def run(cfg):
 
     optimizers = {
         "model_opt": {
-            "modules": ["model.hle", "model.hlp", "model.mae"],
+            "modules": r"model\.(hle|hlp|mae)",  # spt expects a regex; LL is frozen anyway
             "optimizer": dict(cfg.optimizer),
             "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
             "interval": "epoch",
@@ -109,7 +114,19 @@ def run(cfg):
 
     object_dump = ModelObjectCallBack(dirpath=run_dir, filename=cfg.output_model_name,
                                       epoch_interval=1)
-    trainer = pl.Trainer(**cfg.trainer, callbacks=[object_dump], num_sanity_val_steps=1,
+    callbacks = [object_dump]
+    if cfg.get("log") is not None:
+        callbacks.append(IntervalRankMe(
+            name="hl_rankme", target="hl_emb",
+            queue_length=cfg.log.rankme_queue, target_shape=cfg.wm.hl_dim,
+            every_n_epochs=cfg.log.every_n_epochs,
+        ))
+        callbacks.append(PCALatentViz(
+            name="hl_pca", target="hl_emb",
+            queue_length=cfg.log.pca_queue, target_shape=cfg.wm.hl_dim,
+            every_n_epochs=cfg.log.every_n_epochs,
+        ))
+    trainer = pl.Trainer(**cfg.trainer, callbacks=callbacks, num_sanity_val_steps=1,
                          logger=logger, enable_checkpointing=True)
     manager = spt.Manager(trainer=trainer, module=module, data=data_module,
                           ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt")

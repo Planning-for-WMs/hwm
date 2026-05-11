@@ -316,10 +316,12 @@ class HLPredictor(nn.Module):
 
 
 class MacroActionEncoder(nn.Module):
-    """K low-level action tokens -> CLS via transformer -> MLP -> macro_action."""
+    """K low-level action tokens -> append CLS at end -> causal transformer ->
+    MLP head on CLS -> macro_action. Causal mask means CLS attends to all
+    preceding action tokens (and itself), action tokens attend only backward."""
 
-    def __init__(self, action_dim=2, num_actions=5, dim=128, depth=2, heads=4,
-                 mlp_dim=512, dim_head=32, macro_action_dim=16):
+    def __init__(self, action_dim=2, num_actions=5, dim=64, depth=2, heads=4,
+                 mlp_dim=128, dim_head=16, macro_action_dim=4):
         super().__init__()
         self.input_proj = nn.Linear(action_dim, dim)
         self.cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
@@ -337,9 +339,9 @@ class MacroActionEncoder(nn.Module):
     def forward(self, actions):
         """actions: (B, K, A) -> (B, macro_action_dim)."""
         B = actions.size(0)
-        x = self.input_proj(actions)  # (B, K, dim)
+        x = self.input_proj(actions)
         cls = self.cls.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)
+        x = torch.cat([x, cls], dim=1)                  # CLS at end
         x = x + self.pos_embed[:, : x.size(1)]
-        x = self.transformer(x)
-        return self.head(x[:, 0])
+        x = self.transformer(x)                         # causal by default
+        return self.head(x[:, -1])                      # CLS

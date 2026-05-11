@@ -2,7 +2,10 @@ import numpy as np
 import torch
 from pathlib import Path
 from stable_pretraining import data as dt
+from stable_pretraining.callbacks import RankMe
+from stable_pretraining.callbacks.queue import find_or_create_queue_callback
 from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.loggers import WandbLogger
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
@@ -55,3 +58,73 @@ class ModelObjectCallBack(Callback):
             torch.save(model, path)
         except Exception as e:
             print(f"Error saving model object: {e}")
+
+
+class IntervalRankMe(RankMe):
+    """RankMe gated by `every_n_epochs`."""
+    def __init__(self, *args, every_n_epochs: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.every_n_epochs = every_n_epochs
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch,
+                                batch_idx, dataloader_idx=0):
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+        super().on_validation_batch_end(trainer, pl_module, outputs, batch,
+                                        batch_idx, dataloader_idx)
+
+
+class PCALatentViz(Callback):
+    """Every `every_n_epochs` validations, run sklearn PCA(n=2) on a queue of
+    embeddings and log a scatter plot to wandb."""
+
+    def __init__(self, name: str = "hl_pca", target: str = "hl_emb",
+                 queue_length: int = 4096, target_shape: int = 96,
+                 every_n_epochs: int = 1):
+        super().__init__()
+        self.name = name
+        self.target = target
+        self.queue_length = queue_length
+        self.target_shape = target_shape
+        self.every_n_epochs = every_n_epochs
+        self._queue = None
+
+    def setup(self, trainer, pl_module, stage):
+        if self._queue is None:
+            self._queue = find_or_create_queue_callback(
+                trainer, self.target, self.queue_length, self.target_shape,
+                torch.float32, gather_distributed=True, create_if_missing=True,
+            )
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch,
+                                batch_idx, dataloader_idx=0):
+        if batch_idx > 0 or trainer.global_rank != 0:
+            return
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+        emb = self._queue.data
+        if emb is None or emb.numel() == 0:
+            return
+
+        from sklearn.decomposition import PCA
+        import matplotlib.pyplot as plt
+
+        x = emb.detach().cpu().float().numpy()
+        pca = PCA(n_components=2).fit(x)
+        proj = pca.transform(x)
+        ev = pca.explained_variance_ratio_
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(proj[:, 0], proj[:, 1], s=4, alpha=0.5)
+        ax.set_title(f"{self.name} epoch {trainer.current_epoch + 1}  "
+                     f"EVR=[{ev[0]:.2f}, {ev[1]:.2f}]")
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+
+        if isinstance(trainer.logger, WandbLogger):
+            import wandb
+            trainer.logger.experiment.log({
+                self.name: wandb.Image(fig),
+                f"{self.name}/evr_pc1": float(ev[0]),
+                f"{self.name}/evr_pc2": float(ev[1]),
+            }, step=trainer.global_step)
+        plt.close(fig)

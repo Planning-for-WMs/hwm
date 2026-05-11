@@ -2,7 +2,7 @@ defaults:
   - launcher: local
   - _self_
 
-policy_ckpt: ${oc.env:STABLEWM_HOME}/${subdir}/hjepa_epoch_50_object.ckpt
+policy_ckpt: ${oc.env:STABLEWM_HOME}/${subdir}/hjepa_epoch_6_object.ckpt
 subdir: hjepa
 cache_dir: null
 
@@ -20,39 +20,39 @@ dataset:
     - proprio
     - state
 
-seed: 42
+seed: 43
 
-# LL planning (Stage 2): plan K LL actions to reach subgoal
-plan_config:
-  horizon: 5
-  receding_horizon: 5
-  action_block: 5
+# Each LL action is `action_block` raw env-step actions.
+# For strictly open-loop: eval_budget = T_HL * ll_cem.horizon * action_block.
+action_block: 5
 
-ll_solver:
-  _target_: stable_worldmodel.solver.CEMSolver
-  model: ???
-  batch_size: 16
-  num_samples: 300
+# Stage 2: chained open-loop LL CEM in latent space (one per subgoal).
+# `horizon` is the LL action-sequence length per subgoal. The cost is at the
+# predicted final LL emb, evaluated in HL space against the subgoal.
+ll_cem:
+  horizon: 5                # slack vs trained K=5 (predictor is suboptimal)
+  num_samples: 1500
+  topk: 10
+  n_steps: 60
   var_scale: 1.0
-  n_steps: 30
-  topk: 30
-  device: "cuda"
-  seed: ${seed}
+  var_ema: 1.0              # variance multiplied by this each CEM iter
 
-# HL planning (Stage 1): macro action CEM
+# Stage 1: HL CEM, planned once per episode. T_HL macro actions -> T_HL
+# subgoals; the last subgoal is replaced with HLE(LL_goal).
 hl_cem:
-  T_HL: 3            # plan 3 macro actions ahead
-  num_samples: 300
-  topk: 30
-  n_steps: 30
+  T_HL: 6
+  num_samples: 3000
+  topk: 10
+  n_steps: 100
   var_scale: 1.0
+  var_ema: 1.0
 
 eval:
-  num_eval: 50
-  goal_offset_steps: 25
-  eval_budget: 50
+  num_eval: 1
+  goal_offset_steps: 150
+  eval_budget: 200             # = T_HL * ll_cem.horizon * action_block
   img_size: 224
-  dataset_name: pusht_weak_heldout
+  dataset_name: pusht_expert_train
   callables:
     - method: _set_state
       args:
