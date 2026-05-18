@@ -1,5 +1,5 @@
 dataset:
-  num_steps: ${eval:'${wm.k} + 1'}   # K+1 sampled frames per sample
+  num_steps: ${eval:'${wm.history} * ${wm.k_max} + 1'}  # history*K_max+1: covers max stride
   frameskip: 5
   name: pusht_expert_train_emb         # pre-encoded LL CLS (pre-projector); we apply ll.projector in the forward
   keys_to_load:

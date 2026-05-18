@@ -1,0 +1,113 @@
+defaults:
+  - launcher: local
+  - _self_
+
+# Policy checkpoint (HJEPA object pickle saved by train_hl.py)
+policy_ckpt: ${oc.env:STABLEWM_HOME}/hjepa_v12/hjepa_v12_epoch_11_object.ckpt
+subdir: hjepa
+cache_dir: null
+
+# Env / world
+world:
+  env_name: swm/PushT-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ???
+  history_size: 3
+  frame_skip: 1
+max_episode_steps_fixed: 1000
+
+# Dataset normalization (only stats, not pixels)
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+
+seed: 42
+
+# LL action token packs this many raw env-step actions (= LL frameskip).
+action_block: 5
+
+# ---------------------------------------------------------------
+# 3-stage hierarchical CEM policy with **receding-horizon MPC**
+# (closed-loop). Re-plans every `replan_every` LL tokens (executes only the
+# first chunk of the plan, then re-plans from the new observation). CEM means
+# are NOT warm-started across replans — each replan starts cold (mean=0).
+# Between replans the HL state+macro history buffer is shifted with the new
+# observed state and the just-executed macro, mirroring eval_unified.py.
+# ---------------------------------------------------------------
+policy:
+  # mode: "hierarchical" runs the full 3-stage CEM (HL → LL-subgoals → refine).
+  #       "flat" runs a single goal-anchored LL CEM only (no HL, no subgoals).
+  mode: hierarchical
+
+  # MPC replan cadence in LL tokens (= replan_every * action_block env-steps).
+  # 5 LL tokens × 5 action_block = 25 env-step actions between replans.
+  replan_every: 5
+
+  # -----------------------------------------------------------
+  # Stage 1: HL CEM in macro space
+  #   Samples T_HL macros, rolls HLP, cost = L2(s_final, s_goal) in projected
+  #   HL space.  Produces a sequence of subgoals s_1, ..., s_T_HL.
+  # -----------------------------------------------------------
+  hl_cem:
+    T_HL: 2              # number of macros to plan ahead
+    num_samples: 1200
+    topk: 50
+    n_steps: 50
+    var_scale: 1.0       # cold init each replan; this is the initial stdev
+    var_ema: 0.95        # variance decay per CEM iter
+
+  # -----------------------------------------------------------
+  # Stage 2: LL CEM with subgoal-following cost
+  #   Samples LL action sequences of length T_HL * K_macro.
+  #   Cost = Σ_{i=1..T_HL-1} L2(HL(ll_emb_{i*K_macro}), s_i)
+  #          + L2(HL(ll_emb_{T_HL*K_macro}), s_GOAL)        # last segment vs GOAL
+  # -----------------------------------------------------------
+  ll_cem:
+    K_macro: 5
+    num_samples: 300
+    topk: 30
+    n_steps: 30
+    var_scale: 1.0
+    var_ema: 0.95
+
+  # -----------------------------------------------------------
+  # Stage 3: Terminal refinement
+  #   Warm-starts from stage 2's mean within THIS replan only, narrow variance,
+  #   few iters. Cost = L2(HL(ll_emb_final), s_GOAL) only
+  #   (or LL-space if ll_cost=true).
+  # -----------------------------------------------------------
+  refine_cem:
+    num_samples: 300
+    topk: 30
+    n_steps: 5
+    var_scale: 0.2
+    var_ema: 0.9
+    ll_cost: false
+
+# -----------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------
+# eval_budget should comfortably exceed (replan_every * action_block) so the
+# agent actually gets to replan several times. e.g. 100 env-steps with
+# replan_every=5, action_block=5 → 4 replans per episode.
+eval:
+  num_eval: 5
+  goal_offset_steps: 50
+  eval_budget: 100
+  img_size: 224
+  dataset_name: pusht_expert_train
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state
+
+output:
+  filename: pusht_v2_receding_results.txt

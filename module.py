@@ -4,7 +4,15 @@ import torch.nn.functional as F
 from einops import rearrange
 
 def modulate(x, shift, scale):
-    """AdaLN-zero modulation"""
+    """AdaLN-zero modulation.
+
+    NOTE: AdaLN-zero conditioning (this fn + ConditionalBlock + the c-handling
+    in Transformer below) is **only used by the frozen LL predictor**
+    (ARPredictor's transformer was instantiated with block_class=ConditionalBlock
+    during LL training, so the LL checkpoint pickle references these classes
+    by path). The HL stack uses interleaved-token conditioning instead — do
+    NOT delete these classes or unpickling the LL ckpt will break.
+    """
     return x * (1 + scale) + shift
 
 class SIGReg(torch.nn.Module):
@@ -153,11 +161,13 @@ class Transformer(nn.Module):
             else nn.Identity()
         )
 
-        self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
-        )
+        # Only allocate cond_proj when blocks actually consume the `c` argument
+        # (i.e. ConditionalBlock with AdaLN). For plain Blocks, an unused Linear
+        # here makes DDP complain about parameters with no gradient.
+        if block_class is not Block and input_dim != hidden_dim:
+            self.cond_proj = nn.Linear(input_dim, hidden_dim)
+        else:
+            self.cond_proj = nn.Identity()
 
         self.output_proj = (
             nn.Linear(hidden_dim, output_dim)
@@ -286,62 +296,136 @@ class ARPredictor(nn.Module):
 
 
 class HLEncoder(nn.Module):
-    """LL CLS embedding (ll_dim) -> HL state (hl_dim)."""
+    """LL CLS embedding (ll_dim) -> HL state (hl_dim). MLP with `depth` Linear
+    layers, **LayerNorm** + GELU between hidden layers (matches LL's ViT
+    encoder norm choice). depth must be >= 2."""
 
-    def __init__(self, ll_dim=192, hl_dim=96, hidden_dim=256):
+    def __init__(self, ll_dim=192, hl_dim=96, hidden_dim=256, depth=4):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(ll_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hl_dim),
-        )
+        assert depth >= 2
+        layers = [nn.Linear(ll_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim),
+                       nn.LayerNorm(hidden_dim), nn.GELU()]
+        layers += [nn.Linear(hidden_dim, hl_dim)]
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
 
 
-class HLPredictor(nn.Module):
-    """(HL state, macro_action) -> next HL state."""
+class MLPHead(nn.Module):
+    """2-layer MLP with expansion (hl_dim -> hidden -> hl_dim), with
+    BatchNorm1d on the hidden — matches LL projector / pred_proj exactly."""
 
-    def __init__(self, hl_dim=96, macro_action_dim=16, hidden_dim=256, depth=3):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
-        layers = [nn.Linear(hl_dim + macro_action_dim, hidden_dim), nn.GELU()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
-        layers += [nn.Linear(hidden_dim, hl_dim)]
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
 
-    def forward(self, s_hl, macro_a):
-        return self.net(torch.cat([s_hl, macro_a], dim=-1))
+    def forward(self, x):
+        # BN1d needs (N, C); reshape if input is (B, T, C)
+        if x.dim() == 3:
+            B, T, D = x.shape
+            return self.net(x.reshape(B * T, D)).view(B, T, D)
+        return self.net(x)
 
 
 class MacroActionEncoder(nn.Module):
-    """K low-level action tokens -> append CLS at end -> causal transformer ->
-    MLP head on CLS -> macro_action. Causal mask means CLS attends to all
-    preceding action tokens (and itself), action tokens attend only backward."""
+    """Conv1D + causal transformer over RAW action tokens (action_dim-d, e.g.
+    10-d for PushT packed env-actions). The transformer operates at
+    `hidden_dim` internally, but `output_proj` brings the CLS back to
+    `action_dim` so the output sequence preserves the raw-token semantics.
+    Final MLP head maps the `action_dim`-d CLS down to `macro_action_dim`.
 
-    def __init__(self, action_dim=2, num_actions=5, dim=64, depth=2, heads=4,
-                 mlp_dim=128, dim_head=16, macro_action_dim=4):
+    Architecture:
+        actions  (B, K, action_dim)
+            ↓  Conv1d(action_dim → action_dim, k=1)   [per-token feature mixing]
+        x        (B, K, action_dim)
+            ↓  concat CLS + add learned pos-embed
+        x        (B, K+1, action_dim)
+            ↓  Transformer(in=action_dim, hidden=hidden_dim, out=action_dim,
+                           depth, heads, dim_head, mlp_dim, causal)
+        x        (B, K+1, action_dim)
+            ↓  CLS (last token) → MLP(action_dim → mlp_head_dim → macro_action_dim)
+        macro    (B, macro_action_dim)
+    """
+
+    def __init__(self, action_dim=10, macro_action_dim=3, max_k=10,
+                 depth=4, hidden_dim=64, heads=4, dim_head=16, mlp_dim=128,
+                 mlp_head_dim=32, bounded=False):
         super().__init__()
-        self.input_proj = nn.Linear(action_dim, dim)
-        self.cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.pos_embed = nn.Parameter(torch.randn(1, num_actions + 1, dim) * 0.02)
+        self.patch_embed = nn.Conv1d(action_dim, action_dim, kernel_size=1)
+        self.cls = nn.Parameter(torch.randn(1, 1, action_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_k + 1, action_dim) * 0.02)
         self.transformer = Transformer(
-            input_dim=dim, hidden_dim=dim, output_dim=dim,
+            input_dim=action_dim, hidden_dim=hidden_dim, output_dim=action_dim,
+            depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim,
+            block_class=Block,
+        )
+        head_layers = [nn.Linear(action_dim, mlp_head_dim), nn.GELU(),
+                       nn.Linear(mlp_head_dim, macro_action_dim)]
+        if bounded:
+            head_layers.append(nn.Tanh())
+        self.head = nn.Sequential(*head_layers)
+
+    def forward(self, actions):
+        """actions: (B, K, action_dim) raw action tokens -> (B, macro_action_dim).
+        K may vary up to max_k."""
+        B, K = actions.shape[:2]
+        x = self.patch_embed(actions.permute(0, 2, 1)).permute(0, 2, 1)  # (B, K, action_dim)
+        cls = self.cls.expand(B, -1, -1)
+        x = torch.cat([x, cls], dim=1)                                    # (B, K+1, action_dim)
+        x = x + self.pos_embed[:, : K + 1]
+        x = self.transformer(x)                                           # (B, K+1, action_dim)
+        return self.head(x[:, -1])                                        # (B, macro_action_dim)
+
+
+class HLPredictor(nn.Module):
+    """Causal transformer over interleaved (state, macro) tokens (DINO-WM /
+    HWM style). The macro is projected to `hl_dim`, then interleaved with
+    state tokens so it enters the predictor purely via softmax-attended K/V.
+
+    Sequence layout for history H: [s_0, m_0, s_1, m_1, ..., s_{H-1}, m_{H-1}]
+    (length 2H). Causal mask. Next-state prediction is read at position 2H-1
+    (the output corresponding to the last macro token), matching the HWM
+    PushT convention of predicting ẑ_{t+1} from the last (z, l)-pair output.
+
+    Type embeddings distinguish state vs. macro positions; learned positional
+    embeddings cover all 2H slots."""
+
+    def __init__(self, hl_dim=96, macro_action_dim=96, history=3, depth=6,
+                 hidden_dim=None, heads=4, dim_head=24, mlp_dim=192):
+        super().__init__()
+        self.history = history
+        D = hidden_dim if hidden_dim is not None else hl_dim
+        # project both state and macro into the transformer's hidden dim
+        self.state_proj = nn.Linear(hl_dim, D) if hl_dim != D else nn.Identity()
+        self.macro_proj = nn.Linear(macro_action_dim, D)
+        self.pos_embed = nn.Parameter(torch.randn(1, 2 * history, D) * 0.02)
+        self.type_embed = nn.Parameter(torch.randn(2, D) * 0.02)        # 0=state, 1=macro
+        self.transformer = Transformer(
+            input_dim=D, hidden_dim=D, output_dim=D,
             depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim,
             block_class=Block,
         )
         self.head = nn.Sequential(
-            nn.Linear(dim, dim), nn.GELU(),
-            nn.Linear(dim, macro_action_dim),
+            nn.Linear(D, D), nn.GELU(),
+            nn.Linear(D, hl_dim),
         )
 
-    def forward(self, actions):
-        """actions: (B, K, A) -> (B, macro_action_dim)."""
-        B = actions.size(0)
-        x = self.input_proj(actions)
-        cls = self.cls.expand(B, -1, -1)
-        x = torch.cat([x, cls], dim=1)                  # CLS at end
-        x = x + self.pos_embed[:, : x.size(1)]
-        x = self.transformer(x)                         # causal by default
-        return self.head(x[:, -1])                      # CLS
+    def forward(self, states, macros):
+        """states: (B, H, hl_dim).  macros: (B, H, macro_action_dim).
+        Returns (B, hl_dim) — read at the last macro position."""
+        B, H = states.shape[:2]
+        s = self.state_proj(states) + self.type_embed[0]              # (B, H, D)
+        m = self.macro_proj(macros) + self.type_embed[1]              # (B, H, D)
+        D = s.size(-1)
+        x = torch.stack([s, m], dim=2).reshape(B, 2 * H, D)            # (B, 2H, D)
+        x = x + self.pos_embed[:, : 2 * H]
+        x = self.transformer(x)
+        return self.head(x[:, -1])     # last macro position

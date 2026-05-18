@@ -1,7 +1,7 @@
 _target_: stable_worldmodel.solver.CEMSolver
 model: ???
 batch_size: 1 
-num_samples: 900
+num_samples: 300
 var_scale: 1.0
 n_steps: 50
 topk: 30

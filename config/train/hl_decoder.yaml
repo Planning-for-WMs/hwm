@@ -1,0 +1,80 @@
+defaults:
+  - _self_
+
+output_model_name: hl_decoder_v2
+subdir: hl_decoder_v2
+
+# "pre":  encode_hl(post_emb) -> HLE-output (pre-projector HL state).
+# "post": encode_hl_proj(post_emb) -> hl_projector(HLE output).
+#         Use "post" so the decoder operates in the same space the HL predictor
+#         produces (post-hl_pred_proj ≈ post-hl_projector) — required for
+#         decoding predicted subgoals at planning time.
+hl_space: post
+# the pixel decoder must be trained on the matching LL space (post or pre)
+pixel_decoder_weights: ${oc.env:STABLEWM_HOME}/decoder_v4/decoder_v4_weights.ckpt
+
+seed: 3072
+train_split: 0.95
+device: cuda
+amp: True
+compile: null
+resume_from: null
+
+emb_h5: ${oc.env:STABLEWM_HOME}/pusht_expert_train_emb.h5
+pix_h5: ${oc.env:STABLEWM_HOME}/pusht_expert_train.h5
+out_dir: ${oc.env:STABLEWM_HOME}/${subdir}
+
+# frozen checkpoints driving the rest of the pipeline
+# hjepa_ckpt accepts either a specific .ckpt file or a directory — if a dir,
+# the script picks the highest-epoch hjepa_*_epoch_N_object.ckpt file.
+hjepa_ckpt: ${oc.env:STABLEWM_HOME}/hjepa_v12
+
+trainer:
+  epochs: 50
+  save_every: 1
+  grad_clip: 1.0
+
+loader:
+  batch_size: 256     # backward through frozen decoder_v4 + LPIPS dominates VRAM; halve until it fits
+  num_workers: 28
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 1
+
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+
+# new module: maps 96-d HL state -> 192-d pre-projector LL CLS.
+# Sized to ~5.3M params (≈ matching HL encoder capacity) so the decoder has
+# enough headroom to invert the HL bottleneck.
+model:
+  hl_dim: 96
+  ll_dim: 192
+  hidden_dim: 768
+  depth: 5
+
+# the frozen pixel decoder must be reconstructed with these (must match decoder_v2's training config)
+pixel_decoder:
+  emb_dim: 192
+  base: 256
+  init_hw: 7
+
+loss:
+  mse_weight: 1.0
+  lpips_weight: 1.0
+  lpips_net: alex
+  lpips_size: 128
+
+wandb:
+  enabled: True
+  config:
+    entity: wms_at_iitb
+    project: hwm
+    name: ${output_model_name}
+    resume: never
+
+log:
+  every_n_steps: 50
+  traj_fps: 10
+  traj_max_len: 200

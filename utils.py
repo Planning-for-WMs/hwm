@@ -128,3 +128,65 @@ class PCALatentViz(Callback):
                 f"{self.name}/evr_pc2": float(ev[1]),
             }, step=trainer.global_step)
         plt.close(fig)
+
+
+class LatentViz3D(Callback):
+    """3D scatter of a low-d (target_shape=3) latent queue — no PCA, plot the
+    raw dimensions directly. Use for visualizing the MAE macro space when
+    macro_action_dim=3. Samples come from whatever populates the queue, which
+    at training time is the model's outputs on expert trajectories."""
+
+    def __init__(self, name: str = "mae_3d", target: str = "mae_emb",
+                 queue_length: int = 4096, target_shape: int = 3,
+                 every_n_epochs: int = 1):
+        super().__init__()
+        self.name = name
+        self.target = target
+        self.queue_length = queue_length
+        self.target_shape = target_shape
+        self.every_n_epochs = every_n_epochs
+        self._queue = None
+
+    def setup(self, trainer, pl_module, stage):
+        if self._queue is None:
+            self._queue = find_or_create_queue_callback(
+                trainer, self.target, self.queue_length, self.target_shape,
+                torch.float32, gather_distributed=True, create_if_missing=True,
+            )
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch,
+                                batch_idx, dataloader_idx=0):
+        if batch_idx > 0 or trainer.global_rank != 0:
+            return
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+        emb = self._queue.data
+        if emb is None or emb.numel() == 0:
+            return
+
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+
+        x = emb.detach().cpu().float().numpy()
+        assert x.shape[1] == 3, f"LatentViz3D expects 3-d target, got {x.shape[1]}"
+
+        per_dim_std = x.std(axis=0)
+        norms = np.linalg.norm(x, axis=1)
+
+        fig = plt.figure(figsize=(6, 5))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.scatter(x[:, 0], x[:, 1], x[:, 2], s=3, alpha=0.4, c=norms, cmap="viridis")
+        ax.set_xlabel("d0"); ax.set_ylabel("d1"); ax.set_zlabel("d2")
+        ax.set_title(f"{self.name}  epoch {trainer.current_epoch + 1}  "
+                     f"std=[{per_dim_std[0]:.2f}, {per_dim_std[1]:.2f}, {per_dim_std[2]:.2f}]")
+
+        if isinstance(trainer.logger, WandbLogger):
+            import wandb
+            trainer.logger.experiment.log({
+                self.name: wandb.Image(fig),
+                f"{self.name}/std_d0": float(per_dim_std[0]),
+                f"{self.name}/std_d1": float(per_dim_std[1]),
+                f"{self.name}/std_d2": float(per_dim_std[2]),
+                f"{self.name}/norm_mean": float(norms.mean()),
+            }, step=trainer.global_step)
+        plt.close(fig)

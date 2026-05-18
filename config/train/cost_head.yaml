@@ -1,0 +1,59 @@
+defaults:
+  - _self_
+
+output_model_name: cost_head
+subdir: cost_model_v1
+
+seed: 42
+device: cuda
+
+# Pre-encoded HL embeddings produced by preprocess_hl.py.
+# This file is written **once** for a given hjepa checkpoint and contains
+# `ll_post` (N, ll_dim) and `hl_post` (N, hl_dim) plus the row-level metadata
+# (episode_idx, step_idx, ...). The cost trainer reads from here — it does
+# NOT invoke the encoder at training time.
+#
+# Build (once per hjepa checkpoint):
+#   python preprocess_hl.py --hjepa_ckpt $STABLEWM_HOME/hjepa_v12/hjepa_v12_epoch_30_object.ckpt
+hl_emb_h5: ${oc.env:STABLEWM_HOME}/pusht_expert_train_emb_hl.h5
+
+# Output directory and per-epoch checkpoints.
+out_dir: ${oc.env:STABLEWM_HOME}/${subdir}
+
+# How many random (i, j) pairs per episode (i, j drawn without replacement
+# from the same trajectory). Total pairs ≈ pairs_per_episode * #episodes
+# (~18,685 episodes for PushT expert).
+pairs_per_episode: 500
+
+# train / val split fraction (val_frac of total pairs goes to val).
+val_frac: 0.05
+
+trainer:
+  epochs: 100
+  num_workers: 24
+  pin_memory: True
+
+loader:
+  batch_size: 4096
+
+optimizer:
+  type: AdamW
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+
+# CostHead: (hl_target, ll_current) -> scalar.
+# Linear(hl+ll → hidden) → [LN GELU Linear]×(depth-2) → Linear(hidden → 1).
+# Defaults give ~93k params (hidden=192, depth=3).
+model:
+  hl_dim: 96
+  ll_dim: 192
+  hidden_dim: 192
+  depth: 3
+
+wandb:
+  enabled: True     # tiny model; train.log + per-epoch ckpts are usually enough
+  config:
+    entity: wms_at_iitb
+    project: hwm
+    name: ${output_model_name}
+    resume: never

@@ -2,10 +2,10 @@ defaults:
   - _self_
   - data: pusht_hl
 
-output_model_name: hjepa
-subdir: hjepa
+output_model_name: hjepa_v12
+subdir: hjepa_v12
 
-num_workers: 6
+num_workers: 24
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -14,15 +14,18 @@ img_size: 224
 ll_ckpt: ${oc.env:STABLEWM_HOME}/pusht/lewm_object.ckpt
 
 trainer:
-  max_epochs: 50
-  devices: auto
+  max_epochs: 250
+  devices: 1                # 2 × A100 DDP
+  strategy: auto
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
+  sync_batchnorm: false     # we have no BN in HL modules
+  use_distributed_sampler: true   # Lightning default; explicit for clarity
 
 loader:
   batch_size: 256
-  num_workers: 12
+  num_workers: 24
   persistent_workers: True
   prefetch_factor: 3
   pin_memory: True
@@ -44,32 +47,52 @@ wandb:
 
 wm:
   type: hjepa
-  k: 5                # HL stride in sampled frames
   ll_dim: 192
   hl_dim: 96
-  macro_action_dim: 4
+  k_min: 5                 # min HL stride in LL-token units (variable training stride)
+  k_max: 14                # adaptive: one sub-dataset per K in [k_min, k_max].
+                           # Each sub-dataset includes every trajectory long enough for
+                           # *that* K (so all trajectories train at K=k_min, fewer at K=k_max).
+  history: 3               # HLP attends over `history` (s, m) interleaved token pairs
   action_dim: 10           # 2 * frameskip (LL packs frameskip actions per token)
+  macro_action_dim: 96     # MAE output dim = hl_dim (drops the 3D viz, expands capacity)
 
-hle:
-  hidden_dim: 256
+hle:                       # scaled up — 4-layer MLP, LN between hidden layers
+  hidden_dim: 384
+  depth: 4
 
-hlp:
-  hidden_dim: 256
-  depth: 3
+hl_projector:              # asymmetric LeWM-style projector, BN1d on hidden
+  hidden_dim: 1024
 
-mae:
-  dim: 64
-  depth: 2
+hl_pred_proj:
+  hidden_dim: 1024
+
+hlp:                       # interleaved (s, m) tokens, DINO-WM / HWM style
+  hidden_dim: 192          # transformer internal dim (state/macro both projected to here)
+  depth: 6                 # causal transformer blocks
+  heads: 6
+  dim_head: 32             # 6 * 32 = 192
+  mlp_dim: 768
+
+mae:                       # closer to HWM PushT macro encoder capacity
+  hidden_dim: 192          # transformer internal dim (in/out via output_proj back to action_dim)
+  depth: 4
   heads: 4
-  mlp_dim: 128
-  dim_head: 16
+  dim_head: 48             # 4 * 48 = 192
+  mlp_dim: 768
+  mlp_head_dim: 192        # final MLP: action_dim → mlp_head_dim → macro_action_dim
 
 loss:
   sigreg:
     weight: 0.09
     kwargs:
       knots: 17
-      num_proj: 1024
+      num_proj: 512
+  sigreg_mae:
+    weight: 0.09             # tune up if MAE keeps collapsing; tune down if pred_loss stalls
+    kwargs:
+      knots: 17
+      num_proj: 512          # match SIGReg on hl_proj (macros now 96-d)
 
 log:
   every_n_epochs: 1

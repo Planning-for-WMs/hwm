@@ -1,0 +1,67 @@
+defaults:
+  - _self_
+
+output_model_name: decoder_v4
+subdir: decoder_v4
+
+# "pre": train decoder on raw encoder CLS (the original v2 setup).
+# "post": apply the frozen LL projector to the stored emb before passing to
+#         the decoder. Use this so the decoder lives in the predictor's output
+#         space (post-pred_proj ≈ post-projector); needed if you want to
+#         decode rollout frames cleanly.
+space: post
+ll_ckpt: ${oc.env:STABLEWM_HOME}/pusht/lewm_object.ckpt
+
+seed: 3072
+train_split: 0.95
+device: cuda
+amp: True
+compile: null   # null/false to disable; "default" for fast compile; "max-autotune" for best steady-state (~15% on L4)
+resume_from: null   # path to a _weights.ckpt to warm-start the decoder from; null = train from scratch
+
+# data paths (resolved from $STABLEWM_HOME)
+emb_h5: ${oc.env:STABLEWM_HOME}/pusht_expert_train_emb.h5
+pix_h5: ${oc.env:STABLEWM_HOME}/pusht_expert_train.h5
+out_dir: ${oc.env:STABLEWM_HOME}/${subdir}
+
+trainer:
+  epochs: 50
+  save_every: 1
+  grad_clip: 1.0
+
+loader:
+  batch_size: 1024     # per-rank in DDP; with 2 GPUs the effective batch = 1024
+  num_workers: 16     # per-rank; 32 total on 56 vCPUs (room for main + NCCL)
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 1  # one prefetched batch per worker; cuts startup latency + RAM
+
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+
+model:
+  emb_dim: 192
+  base: 256          # 512 → 256 ≈ 1.5x faster on L4; raise back to 512 if recon quality plateaus
+  init_hw: 7
+
+loss:
+  mse_weight: 1.0
+  lpips_weight: 1.0
+  lpips_net: alex    # alex is ~3x faster than vgg; switch to vgg if quality matters
+  lpips_size: 128    # downsample inputs to LPIPS to this resolution; 0 = no resize (224)
+
+wandb:
+  enabled: True
+  config:
+    entity: wms_at_iitb
+    project: hwm
+    name: ${output_model_name}
+    # id removed: every launch gets a fresh wandb run id (avoids dropped logs from
+    # resumed-run step-counter mismatch). Set id explicitly if you want to resume.
+    resume: never
+
+log:
+  every_n_steps: 50
+  traj_fps: 10
+  traj_max_len: 200

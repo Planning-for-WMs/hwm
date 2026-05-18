@@ -1,0 +1,74 @@
+defaults:
+  - launcher: local
+  - _self_
+
+policy_ckpt: ${oc.env:STABLEWM_HOME}/${subdir}_v5/hjepa_v5_epoch_81_object.ckpt
+subdir: hjepa
+cache_dir: null
+
+world:
+  env_name: swm/PushT-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ???
+  history_size: 3
+  frame_skip: 1
+
+# Decoupled from eval_budget so changing eval_budget doesn't shift env RNG.
+max_episode_steps_fixed: 1000
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+
+seed: 42
+
+# Each LL action token = action_block raw env-step actions (frameskip).
+action_block: 5
+
+# Unified single-stage CEM:
+#   sample LL action tokens of length T_HL * K_macro.
+#   - HL rollout: chunk into T_HL blocks of K_macro, pass each through MAE,
+#     then roll HLP to get final HL state -> long-term cost vs HL goal.
+#   - LL rollout: first K_macro tokens fed to LL predictor; final LL emb passed
+#     through HLE and compared to the first HL subgoal -> short-term cost.
+# Replanned every action_block env steps (one LL token executed per replan).
+# Warm-start = shift mean left by one LL token, padding tail by copying last.
+unified:
+  T_HL: 2
+  K_macro: 5
+  num_samples: 1200
+  topk: 50
+  n_steps: 50
+  var_scale: 1.0
+  var_ema: 0.95
+  short_weight: 1.0
+  warm_start: true
+  replan_every: 5
+  # Switch to flat-LL goal-anchored cost once ||HLE(obs)-HLE(goal)||² < this.
+  # 0 disables (only the budget-end trigger applies). Pick a value just above
+  # the typical near-goal real_dist (e.g. 20-30) so the planner gets a strong
+  # gradient through the final approach.
+  final_dist_threshold: 50.0
+  flat_weight: 0.5
+
+eval:
+  num_eval: 1
+  goal_offset_steps: 50
+  eval_budget: 150
+  img_size: 224
+  dataset_name: pusht_expert_train
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state
+
+output:
+  filename: pusht_unified_exp_results.txt

@@ -2,7 +2,7 @@ defaults:
   - launcher: local
   - _self_
 
-policy_ckpt: ${oc.env:STABLEWM_HOME}/${subdir}/hjepa_epoch_6_object.ckpt
+policy_ckpt: ${oc.env:STABLEWM_HOME}/${subdir}_v2/hjepa_epoch_28_object.ckpt
 subdir: hjepa
 cache_dir: null
 
@@ -20,37 +20,50 @@ dataset:
     - proprio
     - state
 
-seed: 43
+seed: 42
 
 # Each LL action is `action_block` raw env-step actions.
 # For strictly open-loop: eval_budget = T_HL * ll_cem.horizon * action_block.
 action_block: 5
+
+# Closed-loop only: last N env steps switch to flat LL (target goal directly,
+# skip HL). 0 disables.
+final_trans_steps: 30
 
 # Stage 2: chained open-loop LL CEM in latent space (one per subgoal).
 # `horizon` is the LL action-sequence length per subgoal. The cost is at the
 # predicted final LL emb, evaluated in HL space against the subgoal.
 ll_cem:
   horizon: 5                # slack vs trained K=5 (predictor is suboptimal)
-  num_samples: 1500
-  topk: 10
-  n_steps: 60
+  num_samples: 300
+  topk: 30
+  n_steps: 30
   var_scale: 1.0
-  var_ema: 1.0              # variance multiplied by this each CEM iter
+  var_ema: 0.9              # variance multiplied by this each CEM iter
+  replan_every: 1           # env steps between LL replans (1 = every step)
+  warm_start: true          # init from previous LL CEM mean (shifted)
+  # Action-smoothness penalty (kevinghst's ActionChangeObjective). Penalizes
+  # magnitude & angle changes between consecutive 2-D env-step actions.
+  # 0 = disabled. Try 0.5-2.0 if the agent moves too fast / jerks around.
+  smoothness_weight: 1.0
+  smoothness_alpha: 0.5     # 0.5 = equal weight on angle vs magnitude diffs
 
 # Stage 1: HL CEM, planned once per episode. T_HL macro actions -> T_HL
 # subgoals; the last subgoal is replaced with HLE(LL_goal).
 hl_cem:
-  T_HL: 6
-  num_samples: 3000
+  T_HL: 2
+  num_samples: 1200
   topk: 10
-  n_steps: 100
-  var_scale: 1.0
-  var_ema: 1.0
+  n_steps: 50
+  var_scale: 0.2
+  var_ema: 0.8
+  replan_every: 25          # env steps between HL replans (= one macro)
+  warm_start: true
 
 eval:
   num_eval: 1
-  goal_offset_steps: 150
-  eval_budget: 200             # = T_HL * ll_cem.horizon * action_block
+  goal_offset_steps: 50
+  eval_budget: 60             # = T_HL * ll_cem.horizon * action_block
   img_size: 224
   dataset_name: pusht_expert_train
   callables:

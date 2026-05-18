@@ -1,0 +1,105 @@
+defaults:
+  - launcher: local
+  - _self_
+
+# Policy checkpoint (HJEPA object pickle saved by train_hl.py)
+policy_ckpt: ${oc.env:STABLEWM_HOME}/hjepa_v12/hjepa_v12_epoch_7_object.ckpt
+subdir: hjepa
+cache_dir: null
+
+# Env / world
+world:
+  env_name: swm/PushT-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ???
+  history_size: 3
+  frame_skip: 1
+max_episode_steps_fixed: 1000
+
+# Dataset normalization (only stats, not pixels)
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+
+seed: 42
+
+# LL action token packs this many raw env-step actions (= LL frameskip).
+action_block: 5
+
+# ---------------------------------------------------------------
+# 3-stage hierarchical CEM policy
+# ---------------------------------------------------------------
+policy:
+  # **Open-loop** planning: plan all 3 stages once at the start of the episode
+  # and execute the full T_HL * K_macro * action_block env-step plan without
+  # re-planning. Set `eval.eval_budget` to that same number of env steps.
+  #
+  # mode: "hierarchical" runs the full 3-stage CEM (HL → LL-subgoals → refine).
+  #       "flat" runs a single goal-anchored LL CEM only (no HL, no subgoals).
+  mode: hierarchical
+
+  # -----------------------------------------------------------
+  # Stage 1: HL CEM in macro space
+  #   Samples T_HL macros, rolls HLP, cost = L2(s_final, s_goal) in projected
+  #   HL space.  Produces a sequence of subgoals s_1, ..., s_T_HL.
+  # -----------------------------------------------------------
+  hl_cem:
+    T_HL: 2              # number of macros to plan ahead
+    num_samples: 1200    # samples per CEM iter
+    topk: 50             # elite set size
+    n_steps: 50          # CEM iterations
+    var_scale: 1.0       # initial sampling stdev (per dim of macro space)
+    var_ema: 0.95        # variance decay per iter
+
+  # -----------------------------------------------------------
+  # Stage 2: LL CEM with subgoal-following cost
+  #   Samples LL action sequences of length T_HL * K_macro.
+  #   Cost = Σ_{i=1..T_HL-1} L2(HL(ll_emb_{i*K_macro}), s_i)
+  #          + L2(HL(ll_emb_{T_HL*K_macro}), s_GOAL)        # last segment vs GOAL
+  # -----------------------------------------------------------
+  ll_cem:
+    K_macro: 5           # LL tokens per macro / per subgoal segment
+    num_samples: 300
+    topk: 30
+    n_steps: 30
+    var_scale: 1.0
+    var_ema: 0.95
+
+  # -----------------------------------------------------------
+  # Stage 3: Terminal refinement
+  #   Warm-starts from stage 2's mean, narrow variance, few iters.
+  #   Cost = L2(HL(ll_emb_final), s_GOAL) only  (or LL-space if ll_cost=true).
+  #   Locks in the trajectory shape and nudges the terminal state to the goal.
+  # -----------------------------------------------------------
+  refine_cem:
+    num_samples: 300
+    topk: 30
+    n_steps: 5
+    var_scale: 0.2
+    var_ema: 0.9
+    ll_cost: false       # set true to compare ll_emb_final vs ll_goal directly
+
+# -----------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------
+eval:
+  num_eval: 5
+  goal_offset_steps: 50
+  eval_budget: 50
+  img_size: 224
+  dataset_name: pusht_expert_train
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state
+
+output:
+  filename: pusht_v2_results.txt

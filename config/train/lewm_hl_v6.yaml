@@ -1,0 +1,97 @@
+defaults:
+  - _self_
+  - data: pusht_hl
+
+# v6: bounded macro (tanh on MAE head) + interleaved (state, macro) HL predictor
+# replacing AdaLN-zero conditioning. Designed to reduce planner-exploitation:
+# - bounded macros cap conditioning magnitude on OOD CEM samples;
+# - attention conditioning replaces multiplicative AdaLN modulation, so a
+#   single OOD macro cannot rescale state activations.
+# Single-step teacher-forcing loss (matches HWM's PushT recipe, γ_tf=1, γ_roll=0).
+
+output_model_name: hjepa_v7
+subdir: hjepa_v7
+
+num_workers: 16
+train_split: 0.9
+seed: 3072
+img_size: 224
+
+ll_ckpt: ${oc.env:STABLEWM_HOME}/pusht/lewm_object.ckpt
+
+trainer:
+  max_epochs: 100
+  devices: 2
+  strategy: ddp
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  use_distributed_sampler: true
+
+loader:
+  batch_size: 128
+  num_workers: 16
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-3
+
+wandb:
+  enabled: True
+  config:
+    entity: wms_at_iitb
+    project: hwm
+    name: ${output_model_name}
+    id: ${subdir}
+    resume: allow
+    log_model: False
+
+wm:
+  type: hjepa
+  ll_dim: 192
+  hl_dim: 96
+  k_min: 5
+  k_max: 10
+  history: 3
+  action_dim: 10
+
+hle:
+  hidden_dim: 256
+  depth: 4
+
+hl_projector:
+  hidden_dim: 384
+
+hl_pred_proj:
+  hidden_dim: 384
+
+hlp:
+  type: interleaved        # NEW: interleaved (s, m) tokens, no AdaLN
+  depth: 6
+  heads: 4
+  dim_head: 24
+  mlp_dim: 192
+
+mae:
+  bounded: true            # NEW: tanh on MAE head -> macro in [-1, 1]^96
+  depth: 2
+  heads: 4
+  dim_head: 24
+  mlp_dim: 192
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 512
+
+log:
+  every_n_epochs: 5
+  rankme_queue: 8192
+  pca_queue: 4096

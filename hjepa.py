@@ -11,13 +11,15 @@ from torch import nn
 
 
 class HierarchicalJEPA(nn.Module):
-    def __init__(self, ll_jepa, hle, hlp, mae, k: int = 5):
+    def __init__(self, ll_jepa, hle, hl_projector, hl_pred_proj, hlp, mae, k: int = 5):
         super().__init__()
         self.ll = ll_jepa
         for p in self.ll.parameters():
             p.requires_grad_(False)
         self.ll.eval()
         self.hle = hle
+        self.hl_projector = hl_projector
+        self.hl_pred_proj = hl_pred_proj
         self.hlp = hlp
         self.mae = mae
         self.k = k
@@ -33,90 +35,69 @@ class HierarchicalJEPA(nn.Module):
         return self.ll.encode({"pixels": pixels})["emb"]
 
     def encode_hl(self, ll_emb):
+        """LL emb -> HL state (post-HLE, pre-projector)."""
         return self.hle(ll_emb)
 
+    def encode_hl_proj(self, ll_emb):
+        """LL emb -> projected HL state (post-projector). Loss space."""
+        return self.hl_projector(self.hle(ll_emb))
+
     def encode_macro(self, actions):
-        """actions: (B, K, A) -> (B, macro_action_dim)."""
+        """actions: (B, K, action_dim) raw action tokens -> (B, macro_action_dim).
+        MAE consumes the raw tokens directly (Conv1D + transformer + CLS-MLP)."""
         return self.mae(actions)
 
-    def predict_hl(self, s_hl, macro_a):
-        return self.hlp(s_hl, macro_a)
+    def predict_hl(self, states_proj, macros):
+        """states_proj: (B, H, hl_dim) projected HL state history.
+        macros:        (B, H, hl_dim) macro tokens.
+        Returns (B, hl_dim): predicted next state in PROJECTED space (post pred-proj)."""
+        return self.hl_pred_proj(self.hlp(states_proj, macros))
 
-    def rollout_hl(self, s_hl_init, macro_actions):
-        """s_hl_init: (B, hl_dim), macro_actions: (B, T_HL, macro_a_dim)."""
-        s = s_hl_init
-        traj = [s]
-        for t in range(macro_actions.size(1)):
-            s = self.predict_hl(s, macro_actions[:, t])
-            traj.append(s)
-        return torch.stack(traj, dim=1)  # (B, T_HL+1, hl_dim)
+    def rollout_hl(self, states_proj_init, macros_init, new_macros):
+        """states_proj_init: (B, H, hl_dim) projected state-history buffer.
+        macros_init:        (B, H, hl_dim) macro-history buffer.
+        new_macros:         (B, T, hl_dim) macros to apply forward.
+        Returns (B, T, hl_dim): predicted future states (projected)."""
+        states = states_proj_init
+        macros = macros_init
+        out = []
+        for t in range(new_macros.size(1)):
+            macros = torch.cat([macros[:, 1:], new_macros[:, t : t + 1]], dim=1)
+            s_next = self.predict_hl(states, macros)
+            states = torch.cat([states[:, 1:], s_next.unsqueeze(1)], dim=1)
+            out.append(s_next)
+        return torch.stack(out, dim=1)
 
-    def ll_rollout_from_emb(self, init_emb, action_sequence, history_size: int = 3):
-        """LL autoregressive rollout starting from a precomputed LL embedding
-        (no pixel encoding). Mirrors `JEPA.rollout` but skips the encoder.
-        init_emb: (B, T_obs, ll_dim).  action_sequence: (B, S, T, action_dim).
-        Returns (B, S, T_obs + n_steps + 1, ll_dim)."""
+    def ll_rollout_from_emb(self, init_emb, action_sequence, history_size: int = 3,
+                            return_raw: bool = False):
+        """Autoregressive LL rollout from a precomputed LL embedding (no pixels).
+        init_emb: (B, 1, ll_dim).  action_sequence: (B, S, T, action_dim).
+        Returns (B, S, 1 + T, ll_dim) of post-pred_proj embeddings (the planning
+        space). If `return_raw=True`, also returns (B, S, T, ll_dim) of pre-pred_proj
+        outputs ("predictor_raw"), useful for decoding via a decoder trained on
+        pre-projector embeddings (works iff pred_proj ≈ projector after training)."""
         B, S, T = action_sequence.shape[:3]
-        H = init_emb.size(1)
-        n_steps = T - H
-
-        emb = init_emb.unsqueeze(1).expand(B, S, -1, -1)
-        emb = rearrange(emb, "b s h d -> (b s) h d").clone()
-
-        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
-        act = rearrange(act_0, "b s t a -> (b s) t a")
-        act_future = rearrange(act_future, "b s t a -> (b s) t a")
-
+        pred_dtype = next(self.ll.predictor.parameters()).dtype
+        emb = rearrange(init_emb.unsqueeze(1).expand(B, S, -1, -1),
+                        "b s h d -> (b s) h d").clone().to(pred_dtype)
+        actions = rearrange(action_sequence, "b s t a -> (b s) t a")
+        act_emb_full = self.ll.action_encoder(actions).to(pred_dtype)
         HS = history_size
-        for t in range(n_steps):
-            act_emb = self.ll.action_encoder(act)
-            pred_emb = self.ll.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
-            emb = torch.cat([emb, pred_emb], dim=1)
-            act = torch.cat([act, act_future[:, t : t + 1]], dim=1)
-        act_emb = self.ll.action_encoder(act)
-        pred_emb = self.ll.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
-        emb = torch.cat([emb, pred_emb], dim=1)
+        raw_steps = [] if return_raw else None
+        for t in range(T):
+            window_start = max(0, t + 1 - HS)
+            out = self.ll.predictor(emb[:, -HS:], act_emb_full[:, window_start : t + 1])
+            out = rearrange(out, "b t d -> (b t) d").float()
+            if return_raw:
+                raw_last = rearrange(out, "(b t) d -> b t d", b=emb.size(0))[:, -1:]
+                raw_steps.append(raw_last)
+            pred = self.ll.pred_proj(out)
+            pred = rearrange(pred, "(b t) d -> b t d", b=emb.size(0))[:, -1:].to(pred_dtype)
+            emb = torch.cat([emb, pred], dim=1)
+        if return_raw:
+            raw = torch.cat(raw_steps, dim=1)  # (B*S, T, ll_dim) in pre-pred_proj space
+            raw = rearrange(raw, "(b s) ... -> b s ...", b=B, s=S)
+            return rearrange(emb, "(b s) ... -> b s ...", b=B, s=S), raw
         return rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
 
 
-class HLPlanModel(nn.Module):
-    """Wrapper exposing HL CEM cost (matches CEMSolver Costable protocol)."""
-
-    def __init__(self, hjepa: HierarchicalJEPA):
-        super().__init__()
-        self.h = hjepa
-
-    def get_cost(self, info_dict, macro_candidates):
-        """info_dict: {'state_hl_init': (B, hl_dim), 'goal_hl': (B, hl_dim)}.
-        macro_candidates: (B, S, T_HL, macro_a_dim). Returns (B, S)."""
-        s_init = info_dict["state_hl_init"]
-        goal = info_dict["goal_hl"]
-        B, S, T, _ = macro_candidates.shape
-        s = s_init.unsqueeze(1).expand(-1, S, -1).reshape(B * S, -1)
-        macro = rearrange(macro_candidates, "b s t a -> (b s) t a")
-        for t in range(T):
-            s = self.h.predict_hl(s, macro[:, t])
-        s = s.view(B, S, -1)
-        cost = ((s - goal.unsqueeze(1)) ** 2).sum(dim=-1)
-        return cost
-
-
-class SubgoalLLModel(nn.Module):
-    """Adapter: LL CEM finds actions to reach an HL subgoal.
-    Cost = ||HLE(LL_predicted_emb_at_T) - subgoal||^2."""
-
-    def __init__(self, hjepa: HierarchicalJEPA):
-        super().__init__()
-        self.h = hjepa
-
-    def get_cost(self, info_dict, action_candidates):
-        device = next(self.parameters()).device
-        for k in list(info_dict.keys()):
-            if torch.is_tensor(info_dict[k]):
-                info_dict[k] = info_dict[k].to(device)
-        info_dict = self.h.ll.rollout(info_dict, action_candidates)
-        pred_emb = info_dict["predicted_emb"]      # (B, S, T+1, ll_dim)
-        final_ll = pred_emb[..., -1, :]            # (B, S, ll_dim)
-        final_hl = self.h.encode_hl(final_ll)      # (B, S, hl_dim)
-        subgoal = info_dict["subgoal_hl"]          # (B, S, hl_dim) (CEM expanded)
-        return ((final_hl - subgoal) ** 2).sum(dim=-1)
